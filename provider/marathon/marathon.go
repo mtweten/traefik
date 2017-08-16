@@ -22,6 +22,9 @@ import (
 	"github.com/containous/traefik/safe"
 	"github.com/containous/traefik/types"
 	"github.com/gambol99/go-marathon"
+	dcosTransport "github.com/mtweten/dcos-go/dcos/http/transport"
+	"os"
+	"io/ioutil"
 )
 
 const (
@@ -52,6 +55,7 @@ type Provider struct {
 	KeepAlive               flaeg.Duration      `description:"Set a non-default TCP Keep Alive time in seconds"`
 	ForceTaskHostname       bool                `description:"Force to use the task's hostname."`
 	Basic                   *Basic              `description:"Enable basic authentication"`
+	DCOSCredentials         *DCOSCredentials    `description:"Enable authentication using service account credentials. This will override the Authorization header, and will automatically refresh auth tokens"`
 	marathonClient          marathon.Marathon
 }
 
@@ -59,6 +63,12 @@ type Provider struct {
 type Basic struct {
 	HTTPBasicAuthUser string `description:"Basic authentication User"`
 	HTTPBasicPassword string `description:"Basic authentication Password"`
+}
+
+type DCOSCredentials struct {
+	UID string `description:"The id for the service account"`
+	PrivateKey string `description:"The private key secret for the service account"`
+	LoginEndpoint string `description:"The DC/OS login endpoint"`
 }
 
 type lightMarathonClient interface {
@@ -87,15 +97,35 @@ func (p *Provider) Provide(configurationChan chan<- types.ConfigMessage, pool *s
 		if err != nil {
 			return err
 		}
-		config.HTTPClient = &http.Client{
-			Transport: &http.Transport{
-				DialContext: (&net.Dialer{
-					KeepAlive: time.Duration(p.KeepAlive),
-					Timeout:   time.Duration(p.DialerTimeout),
-				}).DialContext,
-				TLSClientConfig: TLSConfig,
-			},
+
+		baseTransport := &http.Transport{
+			DialContext: (&net.Dialer{
+				KeepAlive: time.Duration(p.KeepAlive),
+				Timeout:   time.Duration(p.DialerTimeout),
+			}).DialContext,
+			TLSClientConfig: TLSConfig,
 		}
+		httpClient := &http.Client{
+			Transport: baseTransport,
+		}
+
+		if p.DCOSCredentials != nil {
+			privateKey, err := loadPrivateKey(p.DCOSCredentials.PrivateKey)
+			if err != nil {
+				log.Errorf("Failed to load private key, error: %s", err)
+				return err
+			}
+
+			dcosRoundTrip, err := dcosTransport.NewRoundTripper(baseTransport,
+				dcosTransport.OptionCredentials(p.DCOSCredentials.UID, privateKey, p.DCOSCredentials.LoginEndpoint))
+			if err != nil {
+				return err
+			}
+
+			httpClient.Transport = dcosRoundTrip
+		}
+
+		config.HTTPClient = httpClient
 		client, err := marathon.NewClient(config)
 		if err != nil {
 			log.Errorf("Failed to create a client for marathon, error: %s", err)
@@ -201,6 +231,19 @@ func (p *Provider) loadMarathonConfig() *types.Configuration {
 		log.Errorf("failed to render Marathon configuration template: %s", err)
 	}
 	return configuration
+}
+
+func loadPrivateKey(privateKey string) (string, error) {
+	if _, err := os.Stat(privateKey); err == nil {
+		key, err := ioutil.ReadFile(privateKey)
+		if err != nil {
+			return "", fmt.Errorf("Failed to read keyfile. %s", err)
+		}
+
+		return string(key), nil
+	}
+
+	return privateKey, nil
 }
 
 func (p *Provider) applicationFilter(app marathon.Application) bool {
